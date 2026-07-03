@@ -62,9 +62,9 @@ member_schema(::Type{Ponger}) = component(Ponger, hears(:ping, _TimeT, ping_hear
 # ── tests ─────────────────────────────────────────────────────────────────────────────────────────
 @testset "functor: schema + 32-cutoff" begin
     @test publishes(:out, Int) isa RNX.Pub{:out, Int}
-    @test isconcretetype(RNX.ports_nt_type(Tuple{RNX.Pub{:a, Int}, RNX.Sub{:b, Float64, typeof(identity)}}))
+    @test isconcretetype(RNX.ports_nt_type(Tuple{typeof(publishes(:a, Int)), typeof(hears(:b, Float64, identity))}))
     # ports-per-member axis: concrete past 32
-    @test isconcretetype(RNX.ports_nt_type(Tuple{ntuple(i -> RNX.Pub{Symbol("p", i), Int}, 40)...}))
+    @test isconcretetype(RNX.ports_nt_type(Tuple{ntuple(i -> typeof(publishes(Symbol("p", i), Int)), 40)...}))
     # members-per-node axis: node_ports_carrier + build_members concrete past 32
     ns40 = node([("m$i" => DummyState) for i in 1:40]...)
     @test isconc(RNX.node_ports_carrier, (typeof(ns40),))
@@ -1250,4 +1250,106 @@ end
     finally
         close(cn); close(cn.node.context)
     end
+end
+
+# ── endpoint options: `key = value` clauses (QoS, delivery, concurrency) on combinators + directives ──
+@testset "functor: port options (combinators)" begin
+    Q = QosProfile(durability = :transient_local, depth = 3)
+    d = publishes(:out, _TimeT; qos = Q, priority = 4)
+    @test d.opts.qos === Q && d.opts.priority == 4
+    @test !haskey(d.opts, :congestion_control)                     # only EXPLICIT options are captured
+    # the QoS-dependent handle type resolves eagerly: transient_local ⇒ an AdvancedPublisher route
+    @test RNX.handle_type(typeof(d)) === RNX.PublisherHandle{_TimeT, RNX.Zenoh.AdvancedPublisher}
+    @test RNX.handle_type(typeof(publishes(:out, _TimeT))) === RNX.PublisherHandle{_TimeT, RNX.Zenoh.Publisher}
+    @test isconcretetype(RNX.ports_nt_type(Tuple{typeof(d)}))      # opts NamedTuple rides the type, cell stays concrete
+    # NamedTuple qos shorthand normalises to a QosProfile; `_opt_qos` is what the a-priori priming reads
+    d2 = publishes(:out, _TimeT; qos = (durability = :transient_local,))
+    @test d2.opts.qos isa QosProfile && d2.opts.qos.durability === :transient_local
+    @test RNX._opt_qos(d2).durability === :transient_local
+    @test RNX._opt_qos(publishes(:out, _TimeT)) == default_qos()   # no qos option → priming default
+    @test_throws ArgumentError publishes(:out, _TimeT; qos = 17)   # neither a profile nor a NamedTuple
+    s = hears(:in, _TimeT, ping_hear; qos = Q, concurrency = Parallel(2))
+    @test s.opts.qos === Q && s.opts.concurrency isa Parallel && !haskey(s.opts, :view)
+    # the trait forms take the same options; a rebind keeps the original's
+    sv = serves(:add2, FInline.add; qos = Q)
+    @test sv.opts.qos === Q
+    @test serves(:other, sv).opts.qos === Q
+    @test uses(:cli, FInline.add; qos = Q).opts.qos === Q
+end
+
+module OPTD                                          # the directive spellings of the same options
+    using ROSNode
+    const _T = ROSNode.Interfaces.builtin_interfaces.msg.Time
+    handle_track(node, m, msg) = nothing
+    @component mutable struct OptComp{Name} <: Component{Name}
+        n::Int64 = 0
+        @publishes lat::_T on "~/lat" qos = QosProfile(durability = :transient_local)
+        @publishes grouped::_T (qos = QosProfile(reliability = :best_effort), priority = ROSNode.Zenoh.Priorities.DATA_HIGH)
+        @hears (scan::_T, qos = QosProfile(depth = 1)) => function on_scan(node, m::OptComp, msg)
+            m.n += 1; nothing
+        end
+        @hears "~/raw" concurrency = Parallel(2) function on_raw(node, m::OptComp, msg::_T); nothing; end
+        @hears track::_T => handle_track on "~/track" qos = (depth = 5,)
+        @hears eager::_T => handle_track on = "~/eager" qos = (depth = 2,)
+    end
+end
+
+@testset "functor: directive endpoint options" begin
+    ms = RNX.member_schema(OPTD.OptComp)
+    _o(nm) = ms.ports[findfirst(p -> RNX.descname(typeof(p)) === nm, ms.ports)]
+    lat = _o(:lat)                                   # trailing option after the `on` clause
+    @test lat.wire == "~/lat" && lat.opts.qos.durability === :transient_local
+    @test RNX.handle_type(typeof(lat)) === RNX.PublisherHandle{OPTD._T, RNX.Zenoh.AdvancedPublisher}
+    grp = _o(:grouped)                               # paren option group, no wire
+    @test grp.opts.qos.reliability === :best_effort && grp.opts.priority === ROSNode.Zenoh.Priorities.DATA_HIGH
+    sc = _o(:scan)                                   # port group: options ride LEFT of `=>` with the inline def
+    @test sc isa RNX.Sub && sc.opts.qos.depth == 1   # (the group names the port :scan; the handler stays on_scan)
+    raw = _o(:on_raw)                                # leading wire, option between wire and inline def
+    @test raw.wire == "~/raw" && raw.opts.concurrency isa Parallel
+    tr = _o(:track)                                  # NamedTuple qos shorthand through the directive
+    @test tr.wire == "~/track" && tr.opts.qos isa QosProfile && tr.opts.qos.depth == 5
+    ea = _o(:eager)                                  # `on = "wire"` option spelling folds into the wire
+    @test ea.wire == "~/eager" && ea.opts.qos.depth == 2
+
+    # live: the options reach the materialised endpoints (route type + entity QoS)
+    ctx = RNX.Context(; localhost_only = true)
+    cn = run(node("c" => OPTD.OptComp); ctx = ctx, name = "optnode", block = false)
+    try
+        e = entities(cn, cn.members.c)
+        @test e.lat isa RNX.PublisherHandle{OPTD._T, RNX.Zenoh.AdvancedPublisher}
+        @test e.lat.entity.endpoint.qos.durability === :transient_local
+        @test e.scan.entity.endpoint.qos.depth == 1
+    finally
+        close(cn); close(ctx)
+    end
+
+    # guards: the `=>` parse traps, duplicate/conflicting keys, timer options, malformed groups
+    _ge(ex) = (e = _expand_err(ex); e === nothing ? "NO ERROR" : sprint(showerror, e))
+    @test occursin("can't follow `=>` bare", _ge(:(@macroexpand @component mutable struct _GOa{Name} <: Component{Name}
+        @hears a::_GT => qos = 1 function h(node, m, msg); end
+    end)))
+    @test occursin("makes the options the handler", _ge(:(@macroexpand @component mutable struct _GOb{Name} <: Component{Name}
+        @hears a::_GT => (qos = 1)
+    end)))
+    @test occursin("makes the options the handler", _ge(:(@macroexpand @component mutable struct _GOc{Name} <: Component{Name}
+        @hears a::_GT => (qos = 1) function h(node, m, msg); end
+    end)))
+    @test occursin("given more than once", _ge(:(@macroexpand @component mutable struct _GOd{Name} <: Component{Name}
+        @publishes out::_GT qos = 1 qos = 2
+    end)))
+    @test occursin("give the wire once", _ge(:(@macroexpand @component mutable struct _GOe{Name} <: Component{Name}
+        @publishes out::_GT on "w" on = "w2"
+    end)))
+    @test occursin("wire string literal", _ge(:(@macroexpand @component mutable struct _GOf{Name} <: Component{Name}
+        @publishes out::_GT on = somewire
+    end)))
+    @test occursin("takes no options", _ge(:(@macroexpand @component mutable struct _GOg{Name} <: Component{Name}
+        @every tick at 5 qos = 1
+    end)))
+    @test occursin("takes no options", _ge(:(@macroexpand @component mutable struct _GOh{Name} <: Component{Name}
+        @every (tick, qos = 1) => step at 5
+    end)))
+    @test occursin("group entry is `key = value`", _ge(:(@macroexpand @component mutable struct _GOi{Name} <: Component{Name}
+        @publishes (out::_GT, 5)
+    end)))
 end

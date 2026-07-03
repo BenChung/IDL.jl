@@ -12,48 +12,96 @@ export message_type, port_name, port_names, param_names, port, member_names, des
 export register_node_kinds!, @register_nodes                                            # load-by-name registration
 
 # ── descriptors: typed port values; name + message/handler types ride the TYPE ───────────────────
+# Each wire-addressing descriptor also carries `opts` — the EXPLICITLY-given endpoint options (`qos`,
+# `view`, `concurrency`, …) as a NamedTuple whose type is a descriptor param, keeping the schema value
+# fully typed. `construct_port` splats `opts` into the pattern constructor (so option defaults keep one
+# home, the pattern layer) and `port_descs` reads `qos` from it so the a-priori liveliness advertisement
+# carries the endpoint's real QoS. `Pub`'s `H` is the handle type, resolved eagerly in `publishes()` —
+# it is QoS-dependent (`transient_local` ⇒ an AdvancedPublisher route).
 abstract type PortDesc{Name} end
-struct Pub{Name, T}            <: PortDesc{Name}; wire::Union{String, Nothing}; end
-struct Sub{Name, T, F}         <: PortDesc{Name}; handler::F; wire::Union{String, Nothing}; end
-struct Srv{Name, Rq, Rs, F}    <: PortDesc{Name}; handler::F; wire::Union{String, Nothing}; end
-struct Act{Name, A, F, H}      <: PortDesc{Name}; handler::F; wire::Union{String, Nothing}; end
-struct Tmr{Name, F}            <: PortDesc{Name}; handler::F; rate::Union{Float64, Symbol}; end
+struct Pub{Name, T, H, O <: NamedTuple}      <: PortDesc{Name}; wire::Union{String, Nothing}; opts::O; end
+struct Sub{Name, T, F, O <: NamedTuple}      <: PortDesc{Name}; handler::F; wire::Union{String, Nothing}; opts::O; end
+struct Srv{Name, Rq, Rs, F, O <: NamedTuple} <: PortDesc{Name}; handler::F; wire::Union{String, Nothing}; opts::O; end
+struct Act{Name, A, F, H, O <: NamedTuple}   <: PortDesc{Name}; handler::F; wire::Union{String, Nothing}; opts::O; end
+struct Tmr{Name, F}                          <: PortDesc{Name}; handler::F; rate::Union{Float64, Symbol}; end
 
 descname(::Type{<:PortDesc{Name}}) where {Name} = Name
 
 # ── combinators: plain Symbol names (the ctor materialises the type param; no surface Val) ────────
 _norm_wire(on) = on === nothing ? nothing : String(on)
+
+# endpoint-option capture: keep only the explicitly-given entries (drop the `nothing` placeholders) so
+# an omitted option falls through to the pattern constructor's default. Enumerating the keywords per
+# combinator (instead of slurping) makes a typo'd option error at schema build, naming the combinator.
+_norm_qos(q::QosProfile) = q
+_norm_qos(q::NamedTuple) = QosProfile(; q...)   # `qos = (durability = :transient_local,)` shorthand
+_norm_qos(::Nothing) = nothing
+_norm_qos(q) = throw(ArgumentError("qos must be a QosProfile (or a NamedTuple of its keywords), got a $(typeof(q))"))
+function _port_opts(nt::NamedTuple)
+    ks = Tuple(k for k in keys(nt) if getfield(nt, k) !== nothing)
+    return NamedTuple{ks}(map(k -> getfield(nt, k), ks))
+end
+_srv_opts(qos, view, concurrency, detach_timeout) =            # shared with the trait form (functor_authoring.jl)
+    _port_opts((qos = _norm_qos(qos), view = view, concurrency = concurrency, detach_timeout = detach_timeout))
+_opt_qos(d::PortDesc) = get(d.opts, :qos, default_qos())       # the QoS the a-priori graph priming advertises
+
 """
-    publishes(name::Symbol, T; on=nothing) -> Pub
+    publishes(name::Symbol, T; on=nothing, qos=nothing, congestion_control=nothing, priority=nothing) -> Pub
 
 A publisher port carrying message type `T`, sent with `publish(entities(node, m).name, msg)`. `name`
-keys the handle in `entities(node, m)`; `on` sets its topic (the port `name` by default).
+keys the handle in `entities(node, m)`; `on` sets its topic (the port `name` by default). The remaining
+keywords pass through to `Publisher(node, topic, T)` at materialise (defaults are the pattern's); `qos` takes a
+`QosProfile` or a NamedTuple of its keywords — a `:transient_local` durability latches history
+to late-joining subscribers.
 """
-publishes(name::Symbol, ::Type{T}; on = nothing) where {T} = Pub{name, T}(_norm_wire(on))
+function publishes(name::Symbol, ::Type{T}; on = nothing, qos = nothing,
+                   congestion_control = nothing, priority = nothing) where {T}
+    q    = _norm_qos(qos)
+    opts = _port_opts((qos = q, congestion_control = congestion_control, priority = priority))
+    # The handle type is QoS-dependent (`transient_local` ⇒ an AdvancedPublisher route), so resolve it
+    # EAGERLY here — as serves/runs/uses resolve theirs — so the typed port cell matches what
+    # `declare_publisher!` returns at materialise.
+    R = (q !== nothing && q.durability === :transient_local) ? Zenoh.AdvancedPublisher : Zenoh.Publisher
+    return Pub{name, T, PublisherHandle{T, R}, typeof(opts)}(_norm_wire(on), opts)
+end
 
 """
-    hears(name::Symbol, T, handler; on=nothing) -> Sub
+    hears(name::Symbol, T, handler; on=nothing, qos=nothing, view=nothing, concurrency=nothing,
+          match=nothing, force_relatch=nothing) -> Sub
 
 A subscription on message type `T` that runs `handler(node, m, msg::T)` per message. `on` sets the topic
-it subscribes to (the reaction `name` by default).
+it subscribes to (the reaction `name` by default). The remaining keywords pass through to
+`Subscription(node, topic, T)` at materialise (defaults are the pattern's); `qos` takes a `QosProfile`
+or a NamedTuple of its keywords.
 """
-hears(name::Symbol, ::Type{T}, handler; on = nothing) where {T} = Sub{name, T, typeof(handler)}(handler, _norm_wire(on))
+function hears(name::Symbol, ::Type{T}, handler; on = nothing, qos = nothing, view = nothing,
+               concurrency = nothing, match = nothing, force_relatch = nothing) where {T}
+    opts = _port_opts((qos = _norm_qos(qos), view = view, concurrency = concurrency,
+                       match = match, force_relatch = force_relatch))
+    return Sub{name, T, typeof(handler), typeof(opts)}(handler, _norm_wire(on), opts)
+end
 # single service-request marker, but request/response are RESOLVED EAGERLY here (normal world) into
 # the descriptor type params. The @generated carrier builder must NOT call response_type from a
 # generator world: a user-AUTHORED service's _Response binding postdates ROSNode's definition world
 # and would be invisible there (imported/vendored types live in ROSNode's world and masked this).
 """
-    serves(name::Symbol, ReqType, handler; on=nothing) -> Srv
-    serves(name::Symbol, handler; on=nothing) -> Srv          # a bare @service handler
+    serves(name::Symbol, ReqType, handler; on=nothing, qos=nothing, view=nothing,
+           concurrency=nothing, detach_timeout=nothing) -> Srv
+    serves(name::Symbol, handler; on=nothing, …) -> Srv       # a bare @service handler
     serves(name::Symbol, existing::Srv; on=nothing) -> Srv    # rebind under another name
 
 A service-server port answering `handler(node, m, req)` over request type `ReqType`. `on` sets the
-service name (the port `name` by default). Author the request/response types inline with
+service name (the port `name` by default); the remaining keywords pass through to `Service(node, name, SrvType)` at
+materialise (defaults are the pattern's). Author the request/response types inline with
 [`@service`](@ref) (then `serves` takes the bare handler), or pass a pre-authored `ReqType` here. See
 [Services](../communication/services.md).
 """
-serves(name::Symbol, ::Type{Req}, handler; on = nothing) where {Req} =
-    Srv{name, request_type(Req), response_type(Req), typeof(handler)}(handler, _norm_wire(on))
+function serves(name::Symbol, ::Type{Req}, handler; on = nothing, qos = nothing, view = nothing,
+                concurrency = nothing, detach_timeout = nothing) where {Req}
+    opts = _srv_opts(qos, view, concurrency, detach_timeout)
+    return Srv{name, request_type(Req), response_type(Req), typeof(handler), typeof(opts)}(
+        handler, _norm_wire(on), opts)
+end
 """
     every(name::Symbol, rate, handler) -> Tmr
 
@@ -71,38 +119,44 @@ every(name::Symbol, rate::Union{Real, Symbol}, handler) =
 _action_server_type(::Type{A}) where {A} =
     (s = ActionTypeSupport(A); ActionServer{A, goal_type(s), result_type(s), feedback_type(s)})
 """
-    runs(name::Symbol, Action, exec; on=nothing) -> Act
+    runs(name::Symbol, Action, exec; on=nothing, qos=nothing) -> Act
     runs(name::Symbol, existing::Act; on=nothing) -> Act      # rebind under another name
 
 An action-server port running `exec(node, m, goal)` per accepted goal, over a pre-authored `@ros_action`
-type `Action`. `on` sets the action name (the port `name` by default). Author the action inline with
-[`@action`](@ref), or pass a pre-authored `Action` here. See [Actions](../communication/actions.md).
+type `Action`. `on` sets the action name (the port `name` by default); `qos` passes through to the
+action server's five wire endpoints at materialise. Author the action inline with [`@action`](@ref), or
+pass a pre-authored `Action` here. See [Actions](../communication/actions.md).
 """
-runs(name::Symbol, action, exec; on = nothing) =
-    (AT = typeof(action); Act{name, AT, typeof(exec), _action_server_type(AT)}(exec, _norm_wire(on)))
+function runs(name::Symbol, action, exec; on = nothing, qos = nothing)
+    AT   = typeof(action)
+    opts = _port_opts((qos = _norm_qos(qos),))
+    return Act{name, AT, typeof(exec), _action_server_type(AT), typeof(opts)}(exec, _norm_wire(on), opts)
+end
 
 # Rebind an EXISTING descriptor under another port name / wire — reuse a `@service`/`@action`-authored
-# (or any) service/action elsewhere without re-authoring (the "same service, another name" case).
-serves(name::Symbol, d::Srv{N, Rq, Rs, F}; on = nothing) where {N, Rq, Rs, F} =
-    Srv{name, Rq, Rs, F}(d.handler, on === nothing ? d.wire : _norm_wire(on))
-runs(name::Symbol, d::Act{N, A, F, H}; on = nothing) where {N, A, F, H} =
-    Act{name, A, F, H}(d.handler, on === nothing ? d.wire : _norm_wire(on))
+# (or any) service/action elsewhere without re-authoring (the "same service, another name" case). The
+# rebound port keeps the original's endpoint options.
+serves(name::Symbol, d::Srv{N, Rq, Rs, F, O}; on = nothing) where {N, Rq, Rs, F, O} =
+    Srv{name, Rq, Rs, F, O}(d.handler, on === nothing ? d.wire : _norm_wire(on), d.opts)
+runs(name::Symbol, d::Act{N, A, F, H, O}; on = nothing) where {N, A, F, H, O} =
+    Act{name, A, F, H, O}(d.handler, on === nothing ? d.wire : _norm_wire(on), d.opts)
 
 # ── client ports: a persistent ServiceClient/ActionClient held in the member's entities (rclcpp-style;
 #    created at configure, reused for call/send). `IsAct` (resolved at uses()) picks the materialiser. ──
 # `IsAct` (resolved at uses()) picks the materialiser; `H` is the CONCRETE client handle type
 # (`ServiceClient{Req,Resp}` / `ActionClient{A,G,R,F}`), resolved EAGERLY at uses() (like `serves`)
 # and baked here so `handle_type`/`ports_nt_type` are concrete and the client cell is typed.
-struct Use{Name, IsAct, M, H} <: PortDesc{Name}; marker::M; wire::Union{String, Nothing}; end
+struct Use{Name, IsAct, M, H, O <: NamedTuple} <: PortDesc{Name}; marker::M; wire::Union{String, Nothing}; opts::O; end
 """
-    uses(name::Symbol, marker; on=nothing) -> Use
+    uses(name::Symbol, marker; on=nothing, qos=nothing) -> Use
 
 Declare a persistent service/action CLIENT port. `marker` is a service request type (or `@ros_service`
 marker) → a `ServiceClient`, or an `@ros_action`/authored action marker → an `ActionClient`. The client
 is materialised at configure into `entities(node, m).name` and held for the node's life (reuse it for
-`call`/`send`), mirroring rclcpp's `create_client`. `on` sets the service/action name (else the port `name`).
+`call`/`send`), mirroring rclcpp's `create_client`. `on` sets the service/action name (else the port
+`name`); `qos` passes through to the client constructor.
 """
-function uses(name::Symbol, marker; on = nothing)
+function uses(name::Symbol, marker; on = nothing, qos = nothing)
     MT = marker isa Type ? marker : typeof(marker)
     # ActionTypeSupport throws ArgumentError for a non-action marker (a service request type) → service
     # client; any OTHER error (e.g. an UndefVar from a half-registered marker) is real — don't mask it.
@@ -119,7 +173,8 @@ function uses(name::Symbol, marker; on = nothing)
         e isa ArgumentError ?
             (false, ServiceClient{request_type(MT), response_type(MT)}) : rethrow()
     end
-    return Use{name, isact, typeof(marker), H}(marker, _norm_wire(on))
+    opts = _port_opts((qos = _norm_qos(qos),))
+    return Use{name, isact, typeof(marker), H, typeof(opts)}(marker, _norm_wire(on), opts)
 end
 # A client builds its OWN entities lazily (port_descs(::Use)=[] → not in the primed reserved-id block),
 # but ServiceClient → make_entity pops the armed `_id_queue` while `_materialising`, stealing an id meant
@@ -133,9 +188,9 @@ end
 # Unlike Sub/Srv/Act, a client passes no `warmup=:off` — clients self-warm on first call/send and have no
 # `_anchor_functor_member!` branch, so inheriting the node's WarmupPolicy here is the deliberate choice.
 construct_port(d::Use{N, false, M, H}, core, cn, m, pv, wm) where {N, M, H} =
-    _construct_client(core, () -> ServiceClient(core, _wirename(d, wm), d.marker))
+    _construct_client(core, () -> ServiceClient(core, _wirename(d, wm), d.marker; d.opts...))
 construct_port(d::Use{N, true, M, H},  core, cn, m, pv, wm) where {N, M, H} =
-    _construct_client(core, () -> ActionClient(core, _wirename(d, wm), d.marker))
+    _construct_client(core, () -> ActionClient(core, _wirename(d, wm), d.marker; d.opts...))
 port_descs(d::Use, node, w) = EndpointDesc[]    # clients prime lazily — no a-priori local-graph endpoints
 
 # a node() member with explicit wire remaps — remap(SchemaOrType, port => "wire" | (member, port), …)
@@ -152,13 +207,13 @@ _unwrap(x::_Remap) = (x.schema, x.remaps)
 _unwrap(x) = (x, Pair{Symbol, Any}[])
 
 # ── handle types (pure type fn of the descriptor; mirrors _handle_type) ──────────────────────────
-handle_type(::Type{Pub{N, T}})         where {N, T}          = PublisherHandle{T, Zenoh.Publisher}
-handle_type(::Type{Sub{N, T, F}})      where {N, T, F}       = SubscriptionHandle{T}
-handle_type(::Type{Srv{N, Rq, Rs, F}}) where {N, Rq, Rs, F}  = ServiceHandle{Rq, Rs}   # resolved in serves()
-handle_type(::Type{Tmr{N, F}})         where {N, F}          = Timer{ROS}
-handle_type(::Type{Use{N, IsAct, M, H}}) where {N, IsAct, M, H} = H   # client: resolved eagerly in uses()
-handle_type(::Type{Act{N, A, F, H}})   where {N, A, F, H}    = H   # action server: resolved eagerly in runs()
-handle_type(::Type{<:PortDesc})                              = Any
+handle_type(::Type{Pub{N, T, H, O}})      where {N, T, H, O}      = H   # QoS-dependent route: resolved eagerly in publishes()
+handle_type(::Type{Sub{N, T, F, O}})      where {N, T, F, O}      = SubscriptionHandle{T}
+handle_type(::Type{Srv{N, Rq, Rs, F, O}}) where {N, Rq, Rs, F, O} = ServiceHandle{Rq, Rs}   # resolved in serves()
+handle_type(::Type{Tmr{N, F}})            where {N, F}            = Timer{ROS}
+handle_type(::Type{Use{N, IsAct, M, H, O}}) where {N, IsAct, M, H, O} = H   # client: resolved eagerly in uses()
+handle_type(::Type{Act{N, A, F, H, O}})   where {N, A, F, H, O}   = H   # action server: resolved eagerly in runs()
+handle_type(::Type{<:PortDesc})                                   = Any
 
 # the per-member materialised-ports NamedTuple TYPE (the cell's P / the entities view)
 @generated function ports_nt_type(::Type{Ports}) where {Ports <: Tuple}
@@ -602,19 +657,23 @@ _port_wire(d::PortDesc) = (hasfield(typeof(d), :wire) && d.wire !== nothing) ? d
 _wirename(d::PortDesc, wm) = get(wm, _dname(d), _port_wire(d))   # remap override, else the descriptor default
 _hz(d::Tmr, pv) = d.rate isa Symbol ? Float64(getproperty(pv, d.rate)) : d.rate
 
-# retain the _sub_cb/_timer_cb function barriers (concrete callback type, recoverable for anchors)
-construct_port(d::Pub{N, T},         core, cn, m, pv, wm) where {N, T}         = Publisher(core, _wirename(d, wm), T)
-construct_port(d::Sub{N, T, F},      core, cn, m, pv, wm) where {N, T, F}      = Subscription(_sub_cb(d.handler, cn, m), core, _wirename(d, wm), T; warmup = :off)
-construct_port(d::Srv{N, Rq, Rs, F}, core, cn, m, pv, wm) where {N, Rq, Rs, F} = Service(_sub_cb(d.handler, cn, m), core, _wirename(d, wm), Rq; warmup = :off)
+# retain the _sub_cb/_timer_cb function barriers (concrete callback type, recoverable for anchors).
+# Each splats the descriptor's endpoint options into the pattern ctor (an empty `opts` is a no-op).
+construct_port(d::Pub{N, T},         core, cn, m, pv, wm) where {N, T}         = Publisher(core, _wirename(d, wm), T; d.opts...)
+construct_port(d::Sub{N, T, F},      core, cn, m, pv, wm) where {N, T, F}      = Subscription(_sub_cb(d.handler, cn, m), core, _wirename(d, wm), T; warmup = :off, d.opts...)
+construct_port(d::Srv{N, Rq, Rs, F}, core, cn, m, pv, wm) where {N, Rq, Rs, F} = Service(_sub_cb(d.handler, cn, m), core, _wirename(d, wm), Rq; warmup = :off, d.opts...)
 construct_port(d::Tmr{N, F},         core, cn, m, pv, wm) where {N, F}         = _paused_timer(core, Duration(round(Int64, 1.0e9 / _hz(d, pv))), _timer_cb(d.handler, cn, m))
-construct_port(d::Act{N, A, F},      core, cn, m, pv, wm) where {N, A, F}      = _make_action_server(core, _wirename(d, wm), A; body = _action_body(d.handler, cn, m), warmup = :off)
+construct_port(d::Act{N, A, F},      core, cn, m, pv, wm) where {N, A, F}      = _make_action_server(core, _wirename(d, wm), A; body = _action_body(d.handler, cn, m), warmup = :off, d.opts...)
 _action_body(h, cn, m) = goal -> h(cn, m, goal)         # the do-block exec, node-first over the GoalHandle
 
 # ── a-priori graph priming (Stage B over the schema descriptors) ─────────────────────────────────
-port_descs(d::Pub{N, T},         node, w) where {N, T}        = EndpointDesc[_publisher_desc(node, w, T)]
-port_descs(d::Sub{N, T, F},      node, w) where {N, T, F}     = EndpointDesc[_subscription_desc(node, w, T)]
-port_descs(d::Srv{N, Rq, Rs, F}, node, w) where {N, Rq, Rs, F} = EndpointDesc[_service_desc(node, w, Rq)]
-port_descs(d::Act{N, A, F},      node, w) where {N, A, F}     = _action_descs(node, w, A)
+# The primed EndpointDesc carries the port's REAL QoS (from `opts`), so the liveliness advertisement
+# matches what materialise declares — a default-QoS advertisement for a transient_local endpoint would
+# misinform peers' QoS matching.
+port_descs(d::Pub{N, T},         node, w) where {N, T}        = EndpointDesc[_publisher_desc(node, w, T; qos = _opt_qos(d))]
+port_descs(d::Sub{N, T, F},      node, w) where {N, T, F}     = EndpointDesc[_subscription_desc(node, w, T; qos = _opt_qos(d))]
+port_descs(d::Srv{N, Rq, Rs, F}, node, w) where {N, Rq, Rs, F} = EndpointDesc[_service_desc(node, w, Rq; qos = _opt_qos(d))]
+port_descs(d::Act{N, A, F},      node, w) where {N, A, F}     = _action_descs(node, w, A; qos = _opt_qos(d))
 port_descs(d::Tmr, node, w)                                  = EndpointDesc[]
 
 # enumerate the node's member-port endpoints in MATERIALISE order (DI order × spec order × action 1→5)
@@ -876,9 +935,9 @@ end
 # behind `@spawn`, unreachable from `precompile(run)` — port `_anchor_reactions!`'s per-(T,H) chain to
 # the functor descriptors. `precompile_schema(typeof(schema))` belongs in a consumer `@compile_workload`
 # (alongside `precompile(run, (typeof(schema),))`).
-_anchor_port(::Type{Pub{N, T}}) where {N, T} =
+_anchor_port(::Type{D}) where {N, T, D <: Pub{N, T}} =
     (precompile(encode, (T,)); precompile(_publisher_desc, (Node, String, Type{T}));
-     precompile(publish, (handle_type(Pub{N, T}), T)); nothing)   # the monomorphic send the first publish() JITs
+     precompile(publish, (handle_type(D), T)); nothing)   # the monomorphic send the first publish() JITs
 _anchor_port(::Type{<:PortDesc}) = nothing
 
 # the sub receive→dispatch chain the first message JITs, keyed on the concrete `_sub_cb` closure `H`

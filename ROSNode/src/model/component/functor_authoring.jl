@@ -56,32 +56,39 @@ struct NodeFirstAction{F, A}; f::F; fb_pos::Int; end
     _component_action_adapter(a.f, ActionTypeSupport(A), a.fb_pos, node, m)(goal)
 
 # ── derive a descriptor from a trait-bearing handler (serves/runs over an @service/@action marker) ──
-function serves(f::Function; on = nothing)
+# These forms take the same endpoint options as the typed `serves`/`runs` (functor.jl), captured by the
+# shared `_srv_opts`/`_port_opts` and stored on the descriptor.
+function serves(f::Function; on = nothing, qos = nothing, view = nothing, concurrency = nothing,
+                detach_timeout = nothing)
     t = component_service(typeof(f))
     t === nothing && throw(ArgumentError("serves($(f)): not an @service handler — for a raw handler use `serves(:name, ReqType, handler; on)`"))
-    return _serves_trait(f, t, on)
+    return _serves_trait(f, t, on, _srv_opts(qos, view, concurrency, detach_timeout))
 end
-serves(name::Symbol, f::Function; on = nothing) = _serves_trait(f, _need_service(f), on; name = name)
-function _serves_trait(f, t::ComponentService, on; name::Symbol = t.name)
+serves(name::Symbol, f::Function; on = nothing, qos = nothing, view = nothing, concurrency = nothing,
+       detach_timeout = nothing) =
+    _serves_trait(f, _need_service(f), on, _srv_opts(qos, view, concurrency, detach_timeout); name = name)
+function _serves_trait(f, t::ComponentService, on, opts::NamedTuple = (;); name::Symbol = t.name)
     Rq = request_type(typeof(f)); Rs = response_type(typeof(f))      # resolved here, normal world
     h  = NodeFirstService{typeof(f), Rq, Rs}(f)
-    return Srv{name, Rq, Rs, typeof(h)}(h, on === nothing ? t.wire : _norm_wire(on))
+    return Srv{name, Rq, Rs, typeof(h), typeof(opts)}(h, on === nothing ? t.wire : _norm_wire(on), opts)
 end
 _need_service(f) = (t = component_service(typeof(f));
     t === nothing && throw(ArgumentError("serves(name, f): $(f) is not an @service handler")); t)
 
-function runs(f::Function; on = nothing)
+function runs(f::Function; on = nothing, qos = nothing)
     t = component_action(typeof(f))
     t === nothing && throw(ArgumentError("runs($(f)): not an @action handler — for a raw exec use `runs(:name, Action, exec; on)`"))
-    return _runs_trait(f, t, on)
+    return _runs_trait(f, t, on, _port_opts((qos = _norm_qos(qos),)))
 end
-runs(name::Symbol, f::Function; on = nothing) = _runs_trait(f, _need_action(f), on; name = name)
-function _runs_trait(f, t::ComponentAction, on; name::Symbol = t.name)
+runs(name::Symbol, f::Function; on = nothing, qos = nothing) =
+    _runs_trait(f, _need_action(f), on, _port_opts((qos = _norm_qos(qos),)); name = name)
+function _runs_trait(f, t::ComponentAction, on, opts::NamedTuple = (;); name::Symbol = t.name)
     A = action_type(ActionTypeSupport(typeof(f)))            # resolved here, normal world (mirrors serves())
     h = NodeFirstAction{typeof(f), A}(f, t.fb_pos)
     # `construct_port` builds the server from the Act's first type param (the marker `typeof(f)`), so the
     # handle type `H` is resolved over `typeof(f)` too — eagerly here, never in the @generated carrier.
-    return Act{name, typeof(f), typeof(h), _action_server_type(typeof(f))}(h, on === nothing ? t.wire : _norm_wire(on))
+    return Act{name, typeof(f), typeof(h), _action_server_type(typeof(f)), typeof(opts)}(
+        h, on === nothing ? t.wire : _norm_wire(on), opts)
 end
 _need_action(f) = (t = component_action(typeof(f));
     t === nothing && throw(ArgumentError("runs(name, f): $(f) is not an @action handler")); t)
